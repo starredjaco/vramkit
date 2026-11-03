@@ -70,6 +70,29 @@ cos-sim but 4.5% in perplexity), and a repetitive corpus makes perplexity meanin
 fixed: the table above is real diverse prose, end-task perplexity, multiple windows. Reporting the
 correction, not hiding it.
 
+### Does it actually save memory in a decode step? (measured, Mac/MPS)
+
+The compression ratio isn't the benchmark — the dequant path is. A per-channel int8 dequant that
+materialises the fp16 key/value adds a transient copy, so what matters is **peak live memory across a
+decode step**, not the packed size. `bench/mem_decode_mac.py` measures it with real MPS allocations on
+a 7B-GQA config (28 layers, 4 KV-heads, d=128):
+
+| context | fp16 resident | int8 resident | int8 decode-step footprint (streamed) | if you dequantise the whole cache |
+|---|---|---|---|---|
+| 32k | 1.75 GiB | 0.88 GiB (**1.98×**) | 0.94 GiB (**1.85× less than fp16**) | 2.63 GiB — win gone |
+| 64k | 3.50 GiB | 1.76 GiB (**1.98×**) | 1.89 GiB (**1.85× less than fp16**) | 5.26 GiB — win gone |
+
+The capacity win is real **only if you dequantise one layer at a time** — the streamed transient is a
+single layer (64 MiB at 32k, 128 MiB at 64k). Dequantising the whole cache up front materialises a full
+fp16 copy and erases it, so stream per layer or chunk the tokens. At a fixed VRAM budget this is ~1.85×
+more concurrent sequences (or longer context) at 64k. (Thanks to Shaowen Peng on the AMD Developer
+Community for pressing on peak-vs-steady-state.)
+
+**Honest caveat:** on Apple MPS the dequant is a ~3.7–4.4× *compute* overhead per step — this proves the
+**capacity** win, not a speed-up. The throughput / $-per-token win is bandwidth-bound and only shows on a
+memory-bound datacenter GPU (MI300X), which is the open validation below. int4's 4× is on-wire only for
+now (codes are stored `uint8`, not yet nibble-packed).
+
 ## Use it — drop-in KV compression (PyTorch, ROCm/CUDA/MPS/CPU)
 
 `vramkit/kvquant.py` is a device-agnostic module — plain PyTorch, so it runs on **AMD/ROCm** (where
@@ -93,9 +116,10 @@ ceiling that grouping approximates.
 
 On ROCm, long-context inference is a known pain point (the default attention path degrades hard past
 ~64k context, and FP8-KV support is still maturing). KV-cache memory is the lever: a near-lossless 2×
-(or 2.67× with int4 values) means more concurrent requests or longer context per Instinct/Radeon GPU
-— directly closing the gap with NVIDIA on $/token. vramkit is pure PyTorch + numpy, so it drops
-straight into a ROCm stack.
+is a **measured 1.85–1.98× KV-memory cut in a real decode step** (§ decode-step memory above), which at
+a fixed VRAM budget is ~1.85× more concurrent requests or longer context per Instinct/Radeon GPU. The
+throughput / $-per-token side is bandwidth-bound and is the open MI300X validation below — not yet
+claimed. vramkit is pure PyTorch + numpy, so it drops straight into a ROCm stack.
 
 ## Status (honest)
 
@@ -104,15 +128,19 @@ straight into a ROCm stack.
   zstd-19/xz-9e, runs in ~2s on a MacBook.
 - ✅ **KV-cache**: int8 **per-channel keys** = 2× at **+0.1% real perplexity** (near-lossless);
   int8-K/int4-V = 2.67× at +1.4% — all measured end-to-end on a real model.
+- ✅ **Decode-step memory**: streamed int8 KV cuts the per-step footprint **1.85× at 64k**
+  (3.50→1.89 GiB), measured with real MPS allocations (`bench/mem_decode_mac.py`) — the win holds
+  only when dequant is streamed one layer at a time.
 - ✅ Built and benchmarked **entirely on a MacBook** — no datacenter GPU needed to reproduce.
-- ⏳ Next: a grouped per-channel key path for streaming decode (KIVI-style), and a Metal/ROCm
-  dequant kernel so the compressed form is used *live* in attention, not just stored. Seeking
-  MI300X/Radeon time to validate on a 7B+ model and co-build the kernel.
+- ⏳ Next: a grouped per-channel key path for streaming decode (KIVI-style) and a Metal/ROCm fused
+  dequant-in-attention kernel; seeking MI300X/Radeon time to measure the throughput / concurrent-batch
+  ($-per-token) win, which is bandwidth-bound and the one claim still unproven.
 
 ## Layout
 - `vramkit/kvquant.py` — drop-in KV compression (per-token / per-channel, int8 / int4) + self-test.
 - `vramkit/rangecoder.py` — the entropy coder (encoder + decoder + self-test).
 - `bench/validate_ppl_mac.py` — **real-model perplexity** of KV compression (the number that counts).
+- `bench/mem_decode_mac.py` — decode-step KV **memory** (capacity vs bandwidth), measured on MPS.
 - `bench/validate_real_weights.py` — weight codec on real safetensors.
 - `bench/bench_weights.py` / `bench/bench_kvcache.py` — synthetic benchmarks with entropy floors.
 
